@@ -86,7 +86,7 @@ def dashboard_messages(result: AnalysisResult) -> list[dict]:
             f"{apex.client}: "
             f"{format_inr(apex.invoice_amount)}, "
             f"{apex.days_overdue} days overdue, "
-            f"{apex.z_score:.1f}σ beyond normal"
+            f"t-score {apex.t_score:.1f} (threshold {apex.t_anomaly:.2f})"
         )
     else:
         apex_block = "No anomalous client detected."

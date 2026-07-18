@@ -80,14 +80,14 @@ def _render_invoice_row(result, llm, narr, healthy, anom) -> None:
         if anom.days_overdue > 0:
             parts.append(f"{anom.days_overdue}d overdue")
         if anom.censored:
-            parts.append("† z understates (still unpaid)")
+            parts.append("† t understates (still unpaid)")
         st.caption(" · ".join(parts))
 
     with col2:
         st.markdown(f"**{format_inr(anom.invoice_amount)}**")
-        if anom.z_score > 0 and anom.std_days > 0:
+        if anom.t_score > 0 and anom.std_days > 0:
             st.caption(
-                f"{anom.z_score:.1f}σ · "
+                f"t={anom.t_score:.1f} · "
                 f"avg {anom.mean_days:.0f}d"
             )
 
