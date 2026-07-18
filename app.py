@@ -34,6 +34,7 @@ from llm.grounding import build_allowlist, is_grounded
 from llm.prompts import dashboard_messages, email_messages, SCHEMA_DASHBOARD, SCHEMA_EMAIL
 from llm.fallbacks import dashboard_fallback, email_fallback
 from ui.styles import inject_styles, risk_badge_html
+from ui.upload import render_upload_panel
 
 # ── Page config (must be first Streamlit call) ────────────────────────
 st.set_page_config(
@@ -199,6 +200,11 @@ with st.sidebar:
 
     st.divider()
 
+    # ── Bank Statement Upload ─────────────────────────────────
+    render_upload_panel(location="sidebar")
+
+    st.divider()
+
     # Cache stats
     from llm.cache import stats as cache_stats
     s = cache_stats()
@@ -276,13 +282,14 @@ else:
     narr   = st.session_state.narratives
 
     # Import tab modules (avoids circular import at module level)
-    from ui import dashboard, invoices, projections, payments
+    from ui import dashboard, invoices, projections, payments, upload
 
-    tab1, tab2, tab3, tab4 = st.tabs([
+    tab1, tab2, tab3, tab4, tab5 = st.tabs([
         "📊 Dashboard",
         "📋 Invoices",
         "📈 Projections",
         "💳 Payments",
+        "📂 Data",
     ])
 
     with tab1:
@@ -290,7 +297,52 @@ else:
     with tab2:
         invoices.render(result, llm, narr, healthy)
     with tab3:
-        # snapshot embedded in result (Q3 decision — no 4th session state key)
         projections.render(result, result.snapshot)
     with tab4:
         payments.render(result)
+    with tab5:
+        st.markdown("### 📂 Data Ingestion")
+        st.markdown("Import your bank statement or receivables CSV to update the ledger.")
+        st.divider()
+
+        data_col1, data_col2 = st.columns(2)
+        with data_col1:
+            upload.render_upload_panel(location="tab")
+        with data_col2:
+            st.markdown("### 📄 Receivables CSV")
+            csv_up = st.file_uploader(
+                "Upload receivables CSV",
+                type=["csv"],
+                key="csv_receivables_upload",
+                label_visibility="collapsed",
+                help="Columns: client, amount, date, terms_days (optional)",
+            )
+            if csv_up is not None:
+                from data.csv_import import parse_csv, import_to_db
+                rows, csv_errors = parse_csv(csv_up)
+                for e in csv_errors:
+                    st.warning(e)
+                if rows:
+                    st.success(f"Parsed {len(rows)} receivable rows.")
+                    import pandas as pd
+                    from core.money import format_inr
+                    preview = pd.DataFrame([
+                        {
+                            "Client":     r["client"],
+                            "Amount":     format_inr(r["amount"]),
+                            "Date":       str(r["issue_date"]),
+                            "Terms (d)":  r["terms_days"],
+                        }
+                        for r in rows
+                    ])
+                    st.dataframe(preview, use_container_width=True, hide_index=True)
+                    if st.button("✅ Import to Ledger", key="btn_csv_import", type="primary"):
+                        with get_session() as sess:
+                            inserted, db_errs = import_to_db(sess, rows)
+                        for e in db_errs:
+                            st.error(e)
+                        if not db_errs:
+                            st.success(f"Imported {inserted} receivables.")
+                            st.session_state.result     = None
+                            st.session_state.narratives = {}
+                            st.info("← Click Analyse to refresh.")
