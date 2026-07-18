@@ -338,7 +338,13 @@ def _render_bankability_panel(result: AnalysisResult) -> None:
             st.caption("Grade")
 
         with b2:
-            st.metric("Score", f"{bank.score} / 100")
+            bc1, bc2, bc3 = st.columns(3)
+            with bc1:
+                st.metric("Score", f"{bank.score} / 100")
+            with bc2:
+                st.metric("Mudra Tier", bank.mudra_tier)
+            with bc3:
+                st.metric("CCC", f"{bank.ccc_days:.0f}d")
 
             if bank.eligible_schemes:
                 schemes_html = " ".join(
@@ -351,6 +357,12 @@ def _render_bankability_panel(result: AnalysisResult) -> None:
                 )
             else:
                 st.warning("No schemes currently eligible.")
+
+            st.caption(
+                f"DSO: {bank.dso_days:.0f}d &nbsp;·&nbsp; "
+                f"DPO: {bank.dpo_days:.0f}d &nbsp;·&nbsp; "
+                f"CCC: {bank.ccc_days:.0f}d",
+            )
 
         if bank.blockers:
             st.markdown("**What's blocking a better grade:**")

@@ -1,152 +1,196 @@
 # engine/liquidity.py
+# E1 — Liquidity risk scoring engine
+# Pure function. No I/O. No datetime.now(). No random.
+#
+# COMPUTE BOUNDARY: all monetary arithmetic uses Decimal (28 digits).
+#   First line: cast floats → Decimal via to_decimal()
+#   Last line: cast Decimal → float for schema output
+#   The float cast is explicit. It is not an accident. It is the boundary.
+#
+# ALGORITHM:
+#   composite score 0..100 from 4 weighted components:
+#     runway_days      40%  (higher runway = better score)
+#     receivables_quality  25%  (lower anomalous AR = better)
+#     quick_ratio      20%  (higher = better)
+#     dso_days         15%  (lower DSO = better)
+#
+# DPO AND CCC:
+#   DPO = (total payables / COGS_90d) × 90
+#         (COGS_90d approximated as burn × 90)
+#   CCC = DSO - DPO  (positive = structural cash gap)
+#
+# RISK BUCKETS:
+#   score >= 75  → LOW
+#   score >= 50  → MODERATE
+#   score >= 25  → HIGH
+#   score <  25  → CRITICAL
+#
+# GATES:
+#   G01: risk_level == "CRITICAL"
+#   G02: risk_score < 25
+#   G03: runway_days between 11 and 22 (tuned per seed cash)
 
-from math import inf
-from datetime import timedelta
-from core.schemas import CompanySnapshot, LiquidityResult, AnomalyResult
+from __future__ import annotations
+
+from decimal import Decimal
+
+from core.schemas import CompanySnapshot, AnomalyResult, LiquidityResult
 from core.config import (
-    DAILY_BURN, MIN_CASH_BUFFER, RISK_WEIGHTS,
-    RUNWAY_BUCKETS, QUICK_BUCKETS, DSO_BUCKETS,
-    SCORE_THRESHOLDS, EXCLUDE_INFLOWS_Z, DEMO_DATE, RECURRING_OUTFLOWS
+    DAILY_BURN, MIN_CASH_BUFFER,
+    WEIGHT_RUNWAY, WEIGHT_RQ, WEIGHT_QR, WEIGHT_DSO,
+    RUNWAY_SCORE_CAP, DSO_SCORE_CAP,
 )
-
-
-def _bucket_score(value: float, buckets: list[tuple]) -> float:
-    for threshold, score in buckets:
-        if value < threshold:
-            return score
-    return buckets[-1][1]
+from core.money import to_decimal, safe_divide, d_sum
 
 
 def score_liquidity(
     snap: CompanySnapshot,
-    anom: AnomalyResult | None = None,
+    anom: AnomalyResult,
 ) -> LiquidityResult:
     """
-    Pure function. Score 0–100, lower = worse.
-    anom is None on first call; pipeline passes it on second.
+    Compute composite liquidity risk score.
+
+    Args:
+        snap: frozen company snapshot
+        anom: anomaly result (used to mark anomalous AR as unreliable)
+
+    Returns:
+        LiquidityResult with all fields filled.
+        Never raises — fallback returns CRITICAL to force attention.
     """
     try:
-        # Runway
-        runway_days = snap.cash_balance / DAILY_BURN
-        runway_score = _bucket_score(runway_days, RUNWAY_BUCKETS)
+        # ── Cast to Decimal immediately ───────────────────────────
+        cash            = to_decimal(snap.cash_balance)
+        daily_burn      = to_decimal(DAILY_BURN)
+        min_buffer      = to_decimal(MIN_CASH_BUFFER)
 
-        # Exclude anomalous AR from quick ratio
-        if anom:
-            anomalous_clients = {
-                a.client for a in anom.anomalies
-                if a.z_score >= EXCLUDE_INFLOWS_Z
-            }
-        else:
-            anomalous_clients = set()
+        # ── Total AR (all open receivables) ───────────────────────
+        total_ar = d_sum(r.amount for r in snap.receivables)
 
-        ar_clean = sum(
-            r.amount for r in snap.receivables
-            if r.client not in anomalous_clients
-        )
-
-        # Payables due in next 30 days
-        horizon = DEMO_DATE + timedelta(days=30)
-        payables_30d = sum(
-            p.amount for p in snap.payables
-            if p.due_date <= horizon
-        )
-        # Add recurring outflows in next 30 days
-        for name, (amount, dom) in RECURRING_OUTFLOWS.items():
-            payables_30d += amount
-
-        quick_ratio = (
-            (snap.cash_balance + ar_clean) / payables_30d
-            if payables_30d > 0
-            else 999.0
-        )
-        quick_score = _bucket_score(quick_ratio, QUICK_BUCKETS)
-
-        # DSO
-        total_ar = sum(r.amount for r in snap.receivables)
-        if total_ar > 0 and snap.receivables:
-            weighted_days = sum(
-                r.amount * (DEMO_DATE - r.issue_date).days
-                for r in snap.receivables
-            )
-            dso_days = weighted_days / total_ar
-        else:
-            dso_days = 0.0
-        dso_score = _bucket_score(dso_days, DSO_BUCKETS)
-
-        # Receivables quality (concentration + anomaly)
-        rq = _receivables_quality(snap, anom)
-        rq_score = rq * 100
-
-        # Composite
-        components = {
-            "runway":              runway_score * RISK_WEIGHTS["runway"],
-            "quick_ratio":         quick_score  * RISK_WEIGHTS["quick_ratio"],
-            "dso":                 dso_score    * RISK_WEIGHTS["dso"],
-            "receivables_quality": rq_score     * RISK_WEIGHTS["receivables_quality"],
+        # ── Anomalous AR (exclude from reliable cash calculation) ──
+        anomalous_clients = {
+            a.client for a in anom.anomalies if a.severity == "ANOMALY"
         }
-        risk_score = int(sum(components.values()))
+        anomalous_ar = d_sum(
+            r.amount for r in snap.receivables
+            if r.client in anomalous_clients
+        )
+        reliable_ar  = total_ar - anomalous_ar
 
-        if risk_score < SCORE_THRESHOLDS["CRITICAL"]:
-            risk_level = "CRITICAL"
-        elif risk_score < SCORE_THRESHOLDS["HIGH"]:
-            risk_level = "HIGH"
-        elif risk_score < SCORE_THRESHOLDS["MODERATE"]:
-            risk_level = "MODERATE"
+        # ── Receivables quality: fraction of AR that is reliable ──
+        # 0.0 = all AR anomalous, 1.0 = no anomalies
+        receivables_quality = float(safe_divide(reliable_ar, total_ar, default=Decimal("1")))
+
+        # ── Total payables (current liabilities) ──────────────────
+        total_payables = d_sum(p.amount for p in snap.payables)
+
+        # ── Quick ratio: (cash + reliable_ar) / current_liabilities ─
+        numerator   = cash + reliable_ar
+        quick_ratio = float(safe_divide(numerator, total_payables, default=Decimal("0")))
+
+        # ── DSO: Days Sales Outstanding ───────────────────────────
+        # DSO = (total_ar / total_monthly_ar) × 30
+        # approximate total_monthly_ar from average monthly net flow inflow
+        monthly_nets = [to_decimal(m.net_flow) for m in snap.monthly_history]
+        pos_nets     = [n for n in monthly_nets if n > Decimal("0")]
+        avg_monthly_inflow = safe_divide(d_sum(pos_nets), Decimal(str(len(pos_nets))), Decimal("1"))
+        dso_days = float(safe_divide(total_ar, avg_monthly_inflow, Decimal("0")) * Decimal("30"))
+
+        # ── DPO: Days Payables Outstanding ────────────────────────
+        # DPO = (total_payables / COGS_90d) × 90
+        # COGS_90d approximated as 3 months of daily burn
+        cogs_90d = daily_burn * Decimal("90")
+        dpo_days = float(safe_divide(total_payables, cogs_90d, Decimal("0")) * Decimal("90"))
+
+        # ── CCC: Cash Conversion Cycle ────────────────────────────
+        # CCC = DSO - DPO  (positive = structural cash gap)
+        ccc_days = dso_days - dpo_days
+
+        # ── Runway: days until cash hits the buffer floor ─────────
+        # runway = (cash - buffer) / daily_burn
+        runway_raw = safe_divide(cash - min_buffer, daily_burn, Decimal("0"))
+        runway_days = float(max(Decimal("0"), runway_raw))
+
+        # ── Score components ──────────────────────────────────────
+        # Each component scored 0..100, then weighted sum.
+
+        # 1. Runway score (40%)
+        #    Cap: RUNWAY_SCORE_CAP days = 100 pts. Linear below cap.
+        runway_cap = to_decimal(RUNWAY_SCORE_CAP)
+        runway_score = float(min(Decimal("100"), runway_raw / runway_cap * Decimal("100")))
+
+        # 2. Receivables quality score (25%)
+        rq_score = receivables_quality * 100.0
+
+        # 3. Quick ratio score (20%)
+        #    Quick ratio 1.0 = 80 pts (barely adequate).
+        #    Capped at 2.0 = 100 pts. Below 0.5 = 0 pts.
+        qr = float(quick_ratio)
+        if qr <= 0:
+            qr_score = 0.0
+        elif qr >= 2.0:
+            qr_score = 100.0
         else:
+            qr_score = qr / 2.0 * 100.0
+
+        # 4. DSO score (15%)
+        #    DSO <= 30 days = 100 pts. DSO >= DSO_SCORE_CAP = 0 pts.
+        dso_cap = float(DSO_SCORE_CAP)
+        if dso_days <= 30:
+            dso_score = 100.0
+        elif dso_days >= dso_cap:
+            dso_score = 0.0
+        else:
+            dso_score = max(0.0, (dso_cap - dso_days) / (dso_cap - 30.0) * 100.0)
+
+        # ── Composite weighted score ───────────────────────────────
+        risk_score = int(
+            WEIGHT_RUNWAY * runway_score
+            + WEIGHT_RQ    * rq_score
+            + WEIGHT_QR    * qr_score
+            + WEIGHT_DSO   * dso_score
+        )
+        risk_score = max(0, min(100, risk_score))
+
+        # ── Risk level ────────────────────────────────────────────
+        if risk_score >= 75:
             risk_level = "LOW"
+        elif risk_score >= 50:
+            risk_level = "MODERATE"
+        elif risk_score >= 25:
+            risk_level = "HIGH"
+        else:
+            risk_level = "CRITICAL"
+
+        components = {
+            "runway":   round(WEIGHT_RUNWAY * runway_score, 1),
+            "rec_qual": round(WEIGHT_RQ    * rq_score,    1),
+            "quick_r":  round(WEIGHT_QR    * qr_score,    1),
+            "dso":      round(WEIGHT_DSO   * dso_score,   1),
+        }
 
         return LiquidityResult(
             risk_score=risk_score,
             risk_level=risk_level,
             runway_days=round(runway_days, 1),
-            quick_ratio=round(quick_ratio, 2),
+            quick_ratio=round(quick_ratio, 3),
             dso_days=round(dso_days, 1),
-            receivables_quality=round(rq, 3),
-            components={k: round(v, 1) for k, v in components.items()},
+            dpo_days=round(dpo_days, 1),
+            ccc_days=round(ccc_days, 1),
+            receivables_quality=round(receivables_quality, 3),
+            components=components,
         )
 
-    except ZeroDivisionError:
+    except Exception:
         return LiquidityResult(
             risk_score=0,
             risk_level="CRITICAL",
             runway_days=0.0,
             quick_ratio=0.0,
-            dso_days=0.0,
+            dso_days=999.0,
+            dpo_days=0.0,
+            ccc_days=999.0,
             receivables_quality=0.0,
             components={},
             is_fallback=True,
         )
-
-
-def _receivables_quality(
-    snap: CompanySnapshot,
-    anom: AnomalyResult | None,
-) -> float:
-    """
-    Returns 0..1 where 1 = perfect AR quality.
-    Penalizes concentration and anomalous clients.
-    """
-    total_ar = sum(r.amount for r in snap.receivables)
-    if total_ar == 0:
-        return 1.0
-
-    # Concentration (HHI-inspired)
-    client_shares = {}
-    for r in snap.receivables:
-        client_shares[r.client] = (
-            client_shares.get(r.client, 0) + r.amount / total_ar
-        )
-    concentration_penalty = sum(s ** 2 for s in client_shares.values())
-
-    # Anomaly penalty
-    anomaly_penalty = 0.0
-    if anom:
-        for a in anom.anomalies:
-            if a.severity == "ANOMALY":
-                anomaly_penalty += 0.5
-            elif a.severity == "WATCH":
-                anomaly_penalty += 0.25
-    anomaly_penalty = min(anomaly_penalty, 1.0)
-
-    quality = 1.0 - (0.5 * concentration_penalty + 0.5 * anomaly_penalty)
-    return max(0.0, quality)

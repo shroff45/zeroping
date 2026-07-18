@@ -57,6 +57,7 @@ def run_pipeline(snap: CompanySnapshot) -> AnalysisResult:
 
     return AnalysisResult(
         snapshot_hash=snapshot_hash,
+        snapshot=snap,           # embedded — used by what-if engine only
         liquidity=liq,
         anomalies=anom,
         projection=proj,

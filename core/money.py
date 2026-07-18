@@ -1,5 +1,5 @@
 """
-core/money.py — Indian-format Indian Rupee formatter.
+core/money.py — Indian-format Indian Rupee formatter + Decimal helpers.
 
 Pure string arithmetic. No locale module (OS-dependent, breaks on Windows).
 No cleverness. Deterministic.
@@ -20,11 +20,81 @@ Negative: minus goes BEFORE the symbol, never between symbol and magnitude.
 Rounding: Python's round() uses banker's rounding for .5 ties.
 The test suite expects round-half-UP (184_999.999 → 185_000).
 We implement explicit round-half-up via Decimal to be unambiguous.
+
+──────────────────────────────────────────────────────────────────────
+DECIMAL HELPERS (engine compute boundary)
+──────────────────────────────────────────────────────────────────────
+Engines receive floats from the snapshot (JSON-serializable wire format),
+immediately cast to Decimal via to_decimal(), compute in Decimal,
+cast back to float on return.
+
+This is the correctness boundary. The cast-to-float is explicit and
+documented. It is not an accident. It is the boundary.
+
+Pattern in every engine:
+  cash = to_decimal(snap.cash_balance)
+  result = ...compute in Decimal...
+  return SomeResult(field=float(result), ...)
 """
 
 from __future__ import annotations
-from decimal import Decimal, ROUND_HALF_UP
+from decimal import Decimal, ROUND_HALF_UP, getcontext
 
+# Set global Decimal precision to 28 (IBM decNumber standard)
+getcontext().prec = 28
+
+_ZERO = Decimal("0")
+_ONE  = Decimal("1")
+
+
+# ── Decimal helpers ───────────────────────────────────────────────────
+
+def to_decimal(value: float | int | str | Decimal) -> Decimal:
+    """
+    Convert any numeric value to Decimal with 28-digit precision.
+    Use repr(float) to avoid binary floating-point representation errors.
+
+    Examples:
+        to_decimal(67000.0)    → Decimal('67000')
+        to_decimal(185000.0)   → Decimal('185000')
+        to_decimal("67000.0")  → Decimal('67000.0')
+    """
+    if isinstance(value, Decimal):
+        return value
+    if isinstance(value, float):
+        return Decimal(repr(value))
+    return Decimal(str(value))
+
+
+def safe_divide(numerator: Decimal, denominator: Decimal, default: Decimal = _ZERO) -> Decimal:
+    """
+    Decimal division that returns default instead of raising ZeroDivisionError.
+
+    Args:
+        numerator:   Decimal numerator.
+        denominator: Decimal denominator.
+        default:     Value to return if denominator is zero. Default: Decimal('0').
+
+    Returns:
+        numerator / denominator, or default if denominator == 0.
+    """
+    if denominator == _ZERO:
+        return default
+    return numerator / denominator
+
+
+def d_sum(values) -> Decimal:
+    """
+    Sum an iterable of numeric values as Decimal.
+    Avoids float accumulation errors.
+    """
+    total = _ZERO
+    for v in values:
+        total += to_decimal(v)
+    return total
+
+
+# ── Indian rupee formatter ────────────────────────────────────────────
 
 def format_inr(
     amount: float,
@@ -151,6 +221,14 @@ if __name__ == "__main__":
         if got != expected:
             failed += 1
         print(f"{ok} {amt:>12} -> {got!r:<18} expected {expected!r}")
+
+    # Decimal helpers
+    print()
+    assert to_decimal(67000.0) == Decimal("67000")
+    assert safe_divide(Decimal("10"), Decimal("0")) == Decimal("0")
+    assert safe_divide(Decimal("10"), Decimal("2")) == Decimal("5")
+    print("✓ to_decimal and safe_divide OK")
+
     print()
     if failed:
         print(f"FAILED {failed} case(s)")

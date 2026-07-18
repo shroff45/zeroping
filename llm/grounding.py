@@ -14,20 +14,19 @@
 #      produced into a set of allowed floats.
 #   2. extract_numbers(text) pulls every number out of LLM output.
 #   3. is_grounded(text, allowed) checks each extracted number
-#      against the allowlist with a small tolerance.
+#      against the allowlist with BIFURCATED tolerance.
 #   4. Any number not in the allowlist → rejection → fallback.
 #
-# WHAT COUNTS AS ALLOWED:
-#   - Every numeric field in AnalysisResult
-#   - Safe scaffolding: small integers (1-31), MIN_CASH_BUFFER
-#   - Years (2026) are explicitly allowed
-#   - Percentages derived from engine scores are allowed
+# BIFURCATED TOLERANCE (G33, G34):
+#   Monetary values (abs(a) > 100): absolute tolerance ±₹1.00
+#     Reason: invented ₹188,700 vs real ₹185,000 → difference ₹3,700 > ₹1 → FAIL
+#     If flat 1% relative: 185000 * 0.01 = ₹1850 → ₹188,700 would PASS (wrong)
+#   Ratios, scores, days (abs(a) ≤ 100): relative tolerance 1%
+#     Reason: risk_score=22, t_score=7.12 → 1% of 22 = 0.22 → normal prose rounding OK
 #
-# WHAT IS REJECTED:
-#   - Any number the LLM computed itself
-#   - Any number that does not appear in the engine outputs
-#   - Any number that is a reformat of an engine number
-#     (e.g., 185000 instead of 185000.0 → handled by tolerance)
+# GATE VERIFICATION:
+#   G33: is_grounded("₹1,88,700", allowed_with_185000)[0] == False
+#   G34: is_grounded("₹1,85,001", allowed_with_185000)[0] == True  (within ±₹1)
 
 from __future__ import annotations
 
@@ -42,16 +41,33 @@ from core.config import MIN_CASH_BUFFER
 _LOG_PATH = Path("logs/grounding_rejections.log")
 _LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
 
-# Regex: matches integers and decimals, optional leading minus, ignores leading ₹ / Rs. / -
-# Examples matched: 185000, 1,85,000, -185000, 185000.0, 35, 2.87, -504500, -₹5,04,500
-_NUM_RE = re.compile(r"-?[₹]?[\d,]+(?:\.\d+)?")
+# Regex: matches integers and decimals, optional leading minus, strips ₹/Rs./commas
+# Examples matched: 185000, 1,85,000, -185000, 185000.0, 35, 2.87, -504500
+_NUM_RE = re.compile(r"-?(?:[₹]|Rs\.?\s*)?[\d,]+(?:\.\d+)?")
 
-# Exact-match mode for financial amounts: no relative tolerance.
-# Any invented number within 2% of a real balance would pass.
-# For demo: exact string match on formatted amounts is the correct check.
-# We still extract numbers as floats, but compare with 0.001% absolute tolerance
-# (i.e., ±1 rupee on 1 lakh) instead of 2% relative.
-_GROUNDING_TOL = 0.001  # 0.1% absolute tolerance for financial amounts
+# ── Tolerance constants ────────────────────────────────────────────────
+_ABS_TOL_MONEY = 1.0   # ±₹1 absolute for monetary amounts (abs(a) > 100)
+_REL_TOL_RATIO = 0.01  # 1% relative for scores/ratios/days (abs(a) ≤ 100)
+
+
+def _is_match(n: float, a: float) -> bool:
+    """
+    Bifurcated tolerance check.
+
+    Monetary amounts (abs(a) > 100):
+        allowed if abs(n - a) ≤ ₹1.00  (absolute)
+    Ratios, scores, days (abs(a) ≤ 100):
+        allowed if abs(n - a) ≤ 0.01 × max(1.0, abs(a))  (1% relative)
+
+    Design rationale:
+        ₹188,700 vs ₹185,000 → difference ₹3,700 >> ₹1 → FAIL (G33)
+        ₹185,001 vs ₹185,000 → difference ₹1 ≤ ₹1 → PASS (G34)
+        score 22.5 vs 22 → difference 0.5 > 1% of 22 = 0.22 → rounding check
+    """
+    if abs(a) > 100:
+        return abs(n - a) <= _ABS_TOL_MONEY
+    else:
+        return abs(n - a) <= _REL_TOL_RATIO * max(1.0, abs(a))
 
 
 def build_allowlist(result: AnalysisResult) -> set[float]:
@@ -67,6 +83,8 @@ def build_allowlist(result: AnalysisResult) -> set[float]:
     allowed.add(liq.runway_days)
     allowed.add(liq.quick_ratio)
     allowed.add(liq.dso_days)
+    allowed.add(liq.dpo_days)
+    allowed.add(liq.ccc_days)
     allowed.add(liq.receivables_quality)
     for v in liq.components.values():
         allowed.add(v)
@@ -76,7 +94,9 @@ def build_allowlist(result: AnalysisResult) -> set[float]:
         allowed.add(a.invoice_amount)
         allowed.add(float(a.days_since_issue))
         allowed.add(float(a.days_overdue))
-        allowed.add(a.z_score)
+        allowed.add(a.t_score)
+        allowed.add(a.t_watch)
+        allowed.add(a.t_anomaly)
         allowed.add(a.mean_days)
         allowed.add(a.std_days)
 
@@ -99,11 +119,14 @@ def build_allowlist(result: AnalysisResult) -> set[float]:
 
     # ── Bankability ──────────────────────────────────────────
     allowed.add(float(result.bankability.score))
+    allowed.add(result.bankability.ccc_days)
+    allowed.add(result.bankability.dso_days)
+    allowed.add(result.bankability.dpo_days)
 
     # ── Safe scaffolding ─────────────────────────────────────
-    # Small integers used in prose (day numbers, list indices)
+    # Small integers used in prose (day numbers 1-31, list indices)
     allowed |= {float(i) for i in range(1, 32)}
-    # Common prediction horizons
+    # Common projection horizons
     allowed.add(60.0)
     allowed.add(90.0)
     # Year
@@ -120,12 +143,19 @@ def build_allowlist(result: AnalysisResult) -> set[float]:
 def extract_numbers(text: str) -> list[float]:
     """
     Pull every number out of a text string.
-    Strips commas (both Indian and Western grouping) and ₹ / Rs. symbols.
+    Strips commas (Indian and Western grouping), ₹ and Rs. symbols.
     Returns list of floats.
     """
     results: list[float] = []
     for match in _NUM_RE.finditer(text):
-        raw = match.group().replace(",", "").replace("₹", "").replace("Rs.", "").replace("Rs", "")
+        raw = (
+            match.group()
+            .replace(",", "")
+            .replace("₹", "")
+            .replace("Rs.", "")
+            .replace("Rs", "")
+            .strip()
+        )
         try:
             results.append(float(raw))
         except ValueError:
@@ -136,17 +166,13 @@ def extract_numbers(text: str) -> list[float]:
 def is_grounded(
     text: str,
     allowed: set[float],
-    tol: float = _GROUNDING_TOL,
 ) -> tuple[bool, list[float]]:
     """
     Check every number in text against the allowlist.
 
-    Uses absolute tolerance (0.1%) for financial amounts.
-    This rejects invented numbers like 500000 when real balance is 504500
-    (which 2% relative tolerance would have allowed).
-
-    A number n is allowed if there exists a in allowed such that:
-      abs(n - a) <= tol * max(1, abs(a))
+    Uses bifurcated tolerance:
+      Monetary (abs > 100): ±₹1 absolute
+      Ratio/score/days (abs ≤ 100): 1% relative
 
     Returns:
       (True, [])              — all numbers grounded
@@ -154,15 +180,18 @@ def is_grounded(
 
     On violation: writes to rejection log.
     Caller must use fallback when False is returned.
+
+    Gate tests:
+      G33: is_grounded("₹1,88,700", {185000.0})[0] == False
+           abs(188700 - 185000) = 3700 >> ₹1 → FAIL ✓
+      G34: is_grounded("₹1,85,001", {185000.0})[0] == True
+           abs(185001 - 185000) = 1 ≤ ₹1 → PASS ✓
     """
-    extracted = extract_numbers(text)
+    extracted  = extract_numbers(text)
     violations: list[float] = []
 
     for n in extracted:
-        grounded = any(
-            abs(n - a) <= tol * max(1.0, abs(a))
-            for a in allowed
-        )
+        grounded = any(_is_match(n, a) for a in allowed)
         if not grounded:
             violations.append(n)
 
@@ -186,7 +215,7 @@ def _write_rejection_log(text: str, violations: list[float]) -> None:
 def grounding_summary(text: str, allowed: set[float]) -> dict:
     """
     Return a structured summary for the live audit panel.
-    Used by the UI to show grounding status during demo.
+    Uses same bifurcated tolerance as is_grounded().
 
     Returns:
       {
@@ -198,13 +227,9 @@ def grounding_summary(text: str, allowed: set[float]) -> dict:
     extracted = extract_numbers(text)
     passed:   list[float] = []
     rejected: list[float] = []
-    tol = 0.02
 
     for n in extracted:
-        if any(
-            abs(n - a) <= max(tol, abs(a) * tol)
-            for a in allowed
-        ):
+        if any(_is_match(n, a) for a in allowed):
             passed.append(n)
         else:
             rejected.append(n)

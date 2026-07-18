@@ -62,7 +62,7 @@ def dashboard_fallback(result: AnalysisResult) -> dict:
         finding_1 = (
             f"{apex.client} has not paid {format_inr(apex.invoice_amount)} in "
             f"{apex.days_overdue} days — "
-            f"nearly {apex.z_score:.2f}σ above their normal pattern."
+            f"t-score {apex.t_score:.2f} exceeds their {apex.t_anomaly:.2f} threshold."
         )
     else:
         finding_1 = (

@@ -1,6 +1,11 @@
 # core/schemas.py
 # THE CONTRACT. Freeze at T+0:35.
 # Changes after freeze require verbal announcement to all 4 people.
+#
+# DECISIONS IN EFFECT:
+#   Q1: Schemas hold float (JSON-serializable for Streamlit session state).
+#       Decimal enforcement is at the engine compute layer.
+#   Q3: AnalysisResult embeds snapshot → eliminates 4th session state key.
 
 from __future__ import annotations
 from datetime import date
@@ -57,6 +62,8 @@ class LiquidityResult(_Frozen):
     runway_days: float
     quick_ratio: float
     dso_days: float
+    dpo_days: float              # DPO = (AP/COGS_90d) × 90
+    ccc_days: float              # CCC = DSO - DPO (positive = structural cash gap)
     receivables_quality: float   # 0..1
     components: dict[str, float] # score breakdown for UI
     is_fallback: bool = False
@@ -67,11 +74,13 @@ class Anomaly(_Frozen):
     invoice_amount: float
     days_since_issue: int        # issue-anchored (anomaly metric)
     days_overdue: int            # due-date-anchored (UI urgency)
-    z_score: float
+    t_score: float               # t-score (NOT z-score) — df=n-1 per client
+    t_watch: float               # dynamic watch threshold: t.ppf(0.85, df)
+    t_anomaly: float             # dynamic anomaly threshold: t.ppf(0.95, df)
     mean_days: float
     std_days: float
     severity: Literal["NORMAL", "WATCH", "ANOMALY"]
-    censored: bool               # True = still unpaid, z understates
+    censored: bool               # True = still unpaid, t understates true delay
 
 
 class AnomalyResult(_Frozen):
@@ -108,7 +117,7 @@ class PaymentPlan(_Frozen):
     is_fallback: bool = False
 
 
-class GSTEvent(_Frozen):         # B24
+class GSTEvent(_Frozen):
     description: str
     due_date: date
     amount: Optional[float]
@@ -116,20 +125,24 @@ class GSTEvent(_Frozen):         # B24
     urgency: Literal["OVERDUE", "URGENT", "UPCOMING", "FUTURE"]
 
 
-class GSTCalendar(_Frozen):      # B24
+class GSTCalendar(_Frozen):
     events: tuple[GSTEvent, ...]
     next_due: Optional[GSTEvent]
 
 
-class BankabilityResult(_Frozen): # B23
+class BankabilityResult(_Frozen):
     score: int                   # 0..100
     grade: Literal["A", "B", "C", "D", "F"]
+    mudra_tier: str              # "Shishu" | "Kishore" | "Tarun" | "Tarun Plus" | "Not eligible"
     eligible_schemes: tuple[str, ...]
     blockers: tuple[str, ...]
+    ccc_days: float              # CCC displayed as primary metric (G30)
+    dso_days: float              # echoed from LiquidityResult for display
+    dpo_days: float              # echoed from LiquidityResult for display
     is_fallback: bool = False
 
 
-class WhatIfResult(_Frozen):     # B22
+class WhatIfResult(_Frozen):
     scenario_label: str
     delta_cash: float
     new_crossover_day: Optional[int]
@@ -138,7 +151,14 @@ class WhatIfResult(_Frozen):     # B22
 
 
 class AnalysisResult(_Frozen):
+    """
+    Root frozen object. Produced once by run_pipeline().
+    Stored in st.session_state.result.
+    Embeds snapshot so what-if engine has access without
+    a 4th session state key (PRD: exactly 3 keys).
+    """
     snapshot_hash: str
+    snapshot: CompanySnapshot    # embedded — used by what-if engine only
     liquidity: LiquidityResult
     anomalies: AnomalyResult
     projection: ProjectionResult
@@ -157,7 +177,7 @@ def make_fixture_snapshot() -> CompanySnapshot:
     from datetime import date
     return CompanySnapshot(
         as_of=date(2026, 7, 18),
-        cash_balance=67_000.0,
+        cash_balance=117_000.0,   # tuned: cash > rent(45k) + buffer(50k) → G14 PAY_NOW
         receivables=(
             Receivable(
                 client="Apex Builders",
@@ -178,6 +198,13 @@ def make_fixture_snapshot() -> CompanySnapshot:
                 amount=45_000.0,
                 due_date=date(2026, 7, 20),
                 category="rent",
+                flexible=False,
+            ),
+            Payable(
+                payee="Staff Salaries",
+                amount=120_000.0,
+                due_date=date(2026, 7, 31),
+                category="salary",
                 flexible=False,
             ),
             Payable(
