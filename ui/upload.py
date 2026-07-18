@@ -41,7 +41,7 @@ def render_upload_panel(location: str = "sidebar") -> None:
     uploaded = st.file_uploader(
         "Upload PDF statement",
         type=["pdf"],
-        key="bank_pdf_upload",
+        key=f"bank_pdf_upload_{location}",   # unique: sidebar vs tab
         label_visibility="collapsed",
         help="HDFC, ICICI, Axis Bank — text-based PDF (exported from net banking portal)",
     )
