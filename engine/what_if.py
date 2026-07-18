@@ -57,14 +57,14 @@ def what_if_scenario(
     new_cash        = snap.cash_balance + delta
     new_receivables = tuple(r for r in snap.receivables if r.client != client_name)
 
-    # Reconstruct frozen snapshot with modified fields
+    # Reconstruct frozen snapshot using model_dump() to prevent Streamlit hot-reload ValidationError
     new_snap = CompanySnapshot(
         as_of=snap.as_of,
         cash_balance=float(new_cash),
-        receivables=new_receivables,
-        payables=snap.payables,
-        payment_history=snap.payment_history,
-        monthly_history=snap.monthly_history,
+        receivables=tuple(r.model_dump() for r in new_receivables),
+        payables=tuple(p.model_dump() for p in snap.payables),
+        payment_history=tuple(h.model_dump() for h in snap.payment_history),
+        monthly_history=tuple(m.model_dump() for m in snap.monthly_history),
     )
 
     # Re-run affected engines on modified snapshot
