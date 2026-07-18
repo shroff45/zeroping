@@ -15,9 +15,11 @@ from __future__ import annotations
 
 import json
 import urllib.parse
+from datetime import date
 
 import streamlit as st
 
+from core.db import get_session
 from core.schemas import AnalysisResult
 from core.money import format_inr
 from llm.backend import OllamaBackend
@@ -25,6 +27,8 @@ from llm.cache import cache_key, get as cache_get, put as cache_put
 from llm.grounding import build_allowlist, is_grounded
 from llm.prompts import email_messages, SCHEMA_EMAIL
 from llm.fallbacks import email_fallback
+from data.invoice_parser import parse_invoice_pdf
+from data.csv_import import parse_csv, import_to_db
 
 
 def render(
@@ -40,10 +44,16 @@ def render(
           Keys: f'email_{client_name}' → email dict
     healthy: whether Ollama is reachable.
     """
+    # ── Invoice upload section ────────────────────────────────────────
+    _render_invoice_upload()
+
+    st.divider()
+
+    # ── Open invoice status ───────────────────────────────────────────
     anomalies = result.anomalies.anomalies
 
     if not anomalies:
-        st.info("No open invoices to display.")
+        st.info("No open invoices to display. Upload an invoice above to get started.")
         return
 
     st.markdown("### Open Invoice Status")
@@ -54,6 +64,132 @@ def render(
 
     for anom in anomalies:
         _render_invoice_row(result, llm, narr, healthy, anom)
+
+
+# ── Invoice upload helpers ────────────────────────────────────────────
+
+def _render_invoice_upload() -> None:
+    """Upload section: PDF (single invoice) or CSV (bulk)."""
+    with st.expander("➕ Upload Invoice / Add Receivable", expanded=False):
+        up_tab_pdf, up_tab_csv = st.tabs(["📄 PDF Invoice", "📊 CSV Bulk Import"])
+
+        # ── PDF invoice ───────────────────────────────────────────
+        with up_tab_pdf:
+            st.caption("Upload a PDF invoice — client name, amount, and date are auto-detected.")
+            pdf_file = st.file_uploader(
+                "Invoice PDF",
+                type=["pdf"],
+                key="inv_pdf_upload",
+                label_visibility="collapsed",
+            )
+            if pdf_file:
+                with st.spinner("Parsing invoice…"):
+                    fields, errs = parse_invoice_pdf(pdf_file.read())
+
+                for e in errs:
+                    st.warning(e)
+
+                if fields:
+                    # Editable preview — user can correct before saving
+                    st.markdown("**Parsed fields — edit if needed:**")
+                    c1, c2 = st.columns(2)
+                    with c1:
+                        client_val = st.text_input(
+                            "Client name",
+                            value=fields.get("client") or "",
+                            key="inv_pdf_client",
+                        )
+                        amount_val = st.number_input(
+                            "Amount (₹)",
+                            value=float(fields.get("amount") or 0),
+                            min_value=0.0,
+                            step=1000.0,
+                            key="inv_pdf_amount",
+                        )
+                    with c2:
+                        date_val = st.date_input(
+                            "Invoice date",
+                            value=fields.get("issue_date") or date.today(),
+                            key="inv_pdf_date",
+                        )
+                        terms_val = st.number_input(
+                            "Payment terms (days)",
+                            value=int(fields.get("terms_days") or 30),
+                            min_value=1,
+                            max_value=365,
+                            step=1,
+                            key="inv_pdf_terms",
+                        )
+
+                    if st.button("✅ Add to Ledger", key="inv_pdf_confirm", type="primary"):
+                        if not client_val.strip():
+                            st.error("Client name cannot be empty.")
+                        elif amount_val <= 0:
+                            st.error("Amount must be > 0.")
+                        else:
+                            row = {
+                                "client":     client_val.strip(),
+                                "amount":     float(amount_val),
+                                "issue_date": date_val,
+                                "terms_days": int(terms_val),
+                            }
+                            with get_session() as sess:
+                                inserted, db_errs = import_to_db(sess, [row])
+                            for e in db_errs:
+                                st.error(e)
+                            if not db_errs:
+                                st.success(
+                                    f"✅ Added {client_val} — "
+                                    f"{format_inr(amount_val)} to ledger."
+                                )
+                                st.session_state.result     = None
+                                st.session_state.narratives = {}
+                                st.info("← Click **Analyse** to refresh the dashboard.")
+
+        # ── CSV bulk import ───────────────────────────────────────
+        with up_tab_csv:
+            st.caption(
+                "Columns: `client`, `amount`, `date`, `terms` (optional). "
+                "Accepts ₹, Rs., commas. Dates: DD/MM/YYYY, DD-MM-YYYY, etc."
+            )
+            csv_file = st.file_uploader(
+                "Receivables CSV",
+                type=["csv"],
+                key="inv_csv_upload",
+                label_visibility="collapsed",
+            )
+            if csv_file:
+                rows, csv_errs = parse_csv(csv_file)
+                for e in csv_errs:
+                    st.warning(e)
+                if rows:
+                    import pandas as pd
+                    preview = pd.DataFrame([
+                        {
+                            "Client":    r["client"],
+                            "Amount":    format_inr(r["amount"]),
+                            "Date":      str(r["issue_date"]),
+                            "Terms (d)": r["terms_days"],
+                        }
+                        for r in rows
+                    ])
+                    st.dataframe(preview, use_container_width=True, hide_index=True)
+                    st.caption(f"{len(rows)} invoices ready to import.")
+
+                    if st.button(
+                        f"✅ Import {len(rows)} invoices",
+                        key="inv_csv_confirm",
+                        type="primary",
+                    ):
+                        with get_session() as sess:
+                            inserted, db_errs = import_to_db(sess, rows)
+                        for e in db_errs:
+                            st.error(e)
+                        if not db_errs:
+                            st.success(f"✅ Imported {inserted} invoices to ledger.")
+                            st.session_state.result     = None
+                            st.session_state.narratives = {}
+                            st.info("← Click **Analyse** to refresh the dashboard.")
 
 
 # ── Private helpers ───────────────────────────────────────────────────
